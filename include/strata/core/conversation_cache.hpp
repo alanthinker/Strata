@@ -245,12 +245,25 @@ public:
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            bytes_ -= entries_.front().bytes();
-            entries_.pop_front();
-            ++evictions_;
+            evict_oldest();
         }
         return true;
     }
+
+    // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
+    // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
+    // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
+    // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
+    // to the kernel at once - the next admission check reads it back from /proc/meminfo.
+    void evict_oldest() {
+        if (entries_.empty()) return;
+        bytes_ -= entries_.front().bytes();
+        entries_.pop_front();
+        ++evictions_;
+    }
+
+    // The slot count, so a caller that evicts in a loop has a bound it did not invent.
+    size_t slots() const { return slots_; }
 
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
