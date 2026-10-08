@@ -3,12 +3,14 @@
 #pragma once
 
 #include "strata/core/conversation_buffer.hpp"
+#include "strata/core/conversation_memory.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -245,25 +247,57 @@ public:
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            evict_oldest();
+            if (!evict_oldest()) return false;
         }
         return true;
     }
 
-    // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
-    // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
-    // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
-    // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
-    // to the kernel at once - the next admission check reads it back from /proc/meminfo.
-    void evict_oldest() {
-        if (entries_.empty()) return;
+    // The oldest parked conversation leaves.  This is make_room()'s loop body, so the physical-RAM admission
+    // gate of the parking path (admit_ram below) can also free RAM one entry at a time on demand.
+    // False when nothing is parked.
+    bool evict_oldest() {
+        if (entries_.empty()) return false;
         bytes_ -= entries_.front().bytes();
         entries_.pop_front();
         ++evictions_;
+        return true;
     }
 
-    // The slot count, so a caller that evicts in a loop has a bound it did not invent.
-    size_t slots() const { return slots_; }
+    // What evict_oldest() could give back in all: everything parked.
+    size_t evictable_bytes() const {
+        size_t n = 0;
+        for (const auto& e : entries_) n += e.bytes();
+        return n;
+    }
+
+    // The physical-RAM gate of the parking path: may a snapshot of `allocation` bytes be built while the host keeps
+    // `floor` bytes free?  `available()` reads the host's free RAM and `release()` hands what the allocator still
+    // holds of freed memory back to the kernel.  Where conversation_memory_admit refuses, it releases once (make_room
+    // may have dropped a conversation just before, and glibc keeps a freed 16 MiB segment - ConversationBuffer's
+    // grain - in its heap once its mmap threshold has risen) and reads again.  If that is not enough, parked
+    // conversations leave, oldest first, each followed by a release and a new reading, until the snapshot fits.
+    // Nothing leaves if there is no figure to measure by or if all the conversations that may leave hold less than
+    // is missing, as the snapshot would be refused anyway.  `evicted` counts the ones that left.
+    template<class Available, class Release>
+    bool admit_ram(Available&& available, Release&& release, uint64_t allocation, uint64_t floor, size_t& evicted) {
+        auto have = available();
+        if (conversation_memory_admit(have, allocation, floor)) return true;
+        if (!have) return false;
+        release();
+        have = available();
+        if (conversation_memory_admit(have, allocation, floor)) return true;
+        if (!have) return false;
+        const uint64_t short_by = *have < floor ? floor - *have + allocation : allocation - (*have - floor);
+        if (short_by > evictable_bytes()) return false;
+        while (evict_oldest()) {
+            ++evicted;
+            release();
+            have = available();
+            if (conversation_memory_admit(have, allocation, floor)) return true;
+            if (!have) return false;
+        }
+        return false;
+    }
 
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
