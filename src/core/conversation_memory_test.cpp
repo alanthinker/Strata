@@ -79,7 +79,7 @@ int main() {
     }
 #endif
     // Test the real provider without assuming any particular amount of free RAM.
-    const auto available = conversation_available_memory();
+    const auto available = available_host_bytes();
     check(!available || conversation_memory_admit(available, 0, 0), "provider returns bytes or unknown");
 #if defined(_WIN32)
     // Unknown must fail closed in production, but must not let a broken Windows provider pass this test.
