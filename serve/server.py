@@ -2245,15 +2245,71 @@ class Vision:
             out.append(self.encode(src, keep=[p for p, _ in out]))
         return out
 
+    def _ensure_dir(self) -> None:
+        """Make sure the encoder's directory still exists, re-creating it (and dropping the cache that pointed into
+        the old one) when a temp cleaner removed it.  Caller holds self.lock.
+
+        The cached .sve files go with the directory, so a stale cache would hand prepare() a path that no longer
+        stats and the encoder a name it cannot write: the same FileNotFoundError one step later.  The engine reads
+        the combined file this request writes, so nothing is lost by encoding again."""
+        try:
+            if self.dir.is_dir():
+                return
+        except OSError:
+            pass
+        gone = len(self.cache)                            # every cached .sve lived in the removed directory
+        self.cache.clear()
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Keep the old path: the write below then fails with the real error, as before this change.
+            return
+        # The encoder runs with cwd=self.dir (#480: its ENC lines name the files relative to it) and its own cwd is
+        # the deleted directory now: writes there fail and reads of relative names cannot resolve.  Restart it in the
+        # re-created directory.  close() writes QUIT to a pipe whose process may already be gone, hence its guards.
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - a dead encoder must not stop the request
+            self.proc, self.stopped = None, True
+        try:
+            self._start()
+        except (OSError, RuntimeError):
+            self.stopped = True                           # the next request starts it again (alive() is False)
+        if os.environ.get("STRATA_VISION_DIR_LOG") != "0":
+            # self.spawn carries (args, log, env) and log is a file object (the encoder's stderr), not a callable.
+            stream = self.spawn[1] if getattr(self, "spawn", None) else None
+            if stream is not None:
+                try:
+                    stream.write(f"[vision] the encoder's directory {self.dir} was removed (temp cleaner?); "
+                                 f"re-created it and dropped {gone} cached images\n")
+                    stream.flush()
+                except Exception:  # noqa: BLE001 - logging must never break a request
+                    pass
+
     def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
         `keep`: files the caller still needs (never evicted by this call)."""
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
+            # The encoder's directory is a mkdtemp under the system temp directory, and a long-running server
+            # outlives it: systemd-tmpfiles (`q /tmp 1777 root root 10d`) and other cleaners delete directories
+            # in /tmp by age, so after ~10 days every image failed with FileNotFoundError on
+            # ".../strata-vision-xxxx/<hash>.img" (and later on the .sve that prepare() stats).  Nothing ever
+            # re-checked self.dir, so only a restart cured it; re-make it here instead (cheap: one stat per miss).
+            self._ensure_dir()
             if key in self.cache:
-                self.cache[key] = self.cache.pop(key)                  # most recently used last
-                return self.cache[key]
+                # The cache is keyed by the image's hash, not by the file surviving: a cleaner that emptied the
+                # directory (or a half-evicted entry) leaves an entry whose .sve is gone, and prepare() would then
+                # die on stat().  Drop such an entry and encode again.
+                hit = self.cache[key]
+                try:
+                    if hit[0].is_file():
+                        self.cache[key] = self.cache.pop(key)          # most recently used last
+                        return self.cache[key]
+                except OSError:
+                    pass
+                self.cache.pop(key, None)
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -3671,7 +3727,25 @@ class Service:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
+            # A cache hit from an earlier request can name a .sve a temp cleaner has since deleted: encode again
+            # rather than dying on stat() (this raised FileNotFoundError out of _openai, and the client saw a
+            # dropped connection instead of an answer).
+            sums = []
+            for p, _ in encoded:
+                try:
+                    sums.append(Path(p).stat().st_size)
+                except OSError:
+                    # The .sve is gone (the directory was removed): forget the cache, re-make the directory and
+                    # encode this request's images once more.
+                    with self.vision.lock:
+                        self.vision.cache.clear()
+                        self.vision._ensure_dir()
+                    with self._turn(cancel):
+                        encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                                   else [self.vision.encode(src) for src in images])
+                    sums = [Path(q).stat().st_size for q, _ in encoded]
+                    break
+            combined = combined_embeddings_path(self.vision.dir, sum(sums))
             self.embeddings.path = combined             # first, so a half-written one is found as well
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
